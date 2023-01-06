@@ -7,12 +7,15 @@
 """
 
 import random
+from functools import partial
 
 
 LEFT = 0
 DOWN = 1
 RIGHT = 2
 UP = 3
+
+DIRECTIONS = [LEFT, DOWN, UP, RIGHT]
 
 starting_board = [
     [8, None, 8, None],
@@ -98,12 +101,153 @@ def spawn(board):
     return board
 
 
-board = starting_board
-while True:
-    render(board)
-    dir = get_dir()
-    prev_board = board
-    board = rotate(left(rotate(board, dir)), 4 - dir)
-    if prev_board != board:
-        board = spawn(board)
-    # TODO: if dead board
+def has_won(board):
+    return any(col == 2048 for row in board for col in row)
+
+
+def is_full(board):
+    return all(col is not None for row in board for col in row)
+
+
+def move(board, direction):
+    return rotate(left(rotate(board, direction)), 4 - direction)
+
+
+def has_lost(board):
+    if not is_full(board):
+        return False
+    return all(move(board, direction) == board for direction in DIRECTIONS)
+
+
+def win_or_lose(board):
+    large_number = 10000000000
+    if has_won(board):
+        return large_number
+    if has_lost(board):
+        return -large_number
+    return None
+
+
+def empty_space(board):
+    return sum(1 if col is None else 0 for row in board for col in row)
+
+
+class EmptySpace:
+    def score(self, board):
+        wl = win_or_lose(board)
+        if wl:
+            return wl
+        return empty_space(board)
+
+    def name(self):
+        return "EmptySpace"
+
+
+class HighestTile:
+    def score(self, board):
+        wl = win_or_lose(board)
+        if wl:
+            return wl
+        return highest_tile(board)
+
+    def name(self):
+        return "HighestTile"
+
+
+class Combined:
+    def score(self, board):
+        wl = win_or_lose(board)
+        if wl:
+            return wl
+        return empty_space(board) + highest_tile(board)
+
+    def name(self):
+        return "Combined"
+
+
+class Random:
+    def choose_move(self, board):
+        return random.choice(DIRECTIONS)
+
+    def name(self):
+        return "Random"
+
+
+class Human:
+    def choose_move(self, board):
+        render(board)
+        return get_dir()
+
+    def name(self):
+        return "Human"
+
+
+class OnePly:
+    def __init__(self, heuristic):
+        self.heuristic = heuristic
+
+    def choose_move(self, board):
+        best_dir = None
+        best_score = None
+        for direction in DIRECTIONS:
+            if not move_is_valid(board, direction):
+                continue
+            new_board = move(board, direction)
+            score = self.heuristic.score(new_board)
+            if best_score is None or score > best_score:
+                best_dir = direction
+                best_score = score
+        return best_dir
+
+    def name(self):
+        return f"OnePly({self.heuristic.name()})"
+
+
+def highest_tile(board):
+    return max(col for row in board for col in row if col is not None)
+
+
+def move_is_valid(board, direction):
+    new_board = move(board, direction)
+    return new_board != board
+
+
+def run_game(strategy):
+    board = starting_board
+    count = 0
+    while not has_lost(board) and not has_won(board):
+        direction = strategy.choose_move(board)
+        prev_board = board
+        board = move(board, direction)
+        if prev_board != board:
+            board = spawn(board)
+            count += 1
+    return highest_tile(board), count
+
+
+def compare_strategies(strategies):
+    NUMBER_OF_RUNS = 10
+    for strategy in strategies:
+        scores = []
+        for _ in range(NUMBER_OF_RUNS):
+            score, _ = run_game(strategy)
+            scores.append(score)
+        print(
+            f"Stats for {strategy.name()}; max: {max(scores)}, avg: {sum(scores) / len(scores)}"
+        )
+
+
+compare_strategies(
+    [OnePly(HighestTile()), OnePly(EmptySpace()), OnePly(Combined()), Random()]
+)
+
+
+def losing_board():
+    count = 2
+    result = []
+    for _ in range(4):
+        row = []
+        for _ in range(4):
+            row.append(count)
+        result.append(row)
+    return result
