@@ -1,426 +1,320 @@
-"""
-- make the game
-- 4x4
-- arrows to move
-- after move, a free square becomes a 2 or 4 (25%)
-- print to terminal
-"""
-
-import dis
-import math
+import argparse
 import random
-from abc import ABC, abstractmethod
+from enum import Enum
+from functools import partial
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
+from time import perf_counter
+from typing import (
+    Type,
+    Collection,
+    Final,
+    Iterable,
+    Iterator,
+    Protocol,
+    Sequence,
+)
 
-LEFT = 0
-DOWN = 1
-RIGHT = 2
-UP = 3
+from tqdm import tqdm
 
 
-def direction_to_str(direction):
-    return {
-        0: "LEFT",
-        1: "DOWN",
-        2: "RIGHT",
-        3: "UP",
-    }[direction]
+# TYPES!
 
 
-DIRECTIONS = [LEFT, DOWN, UP, RIGHT]
+class Direction(Enum):
+    LEFT = 0
+    DOWN = 1
+    RIGHT = 2
+    UP = 3
 
-starting_board = [
-    [8, None, 8, None],
-    [16, None, None, 16],
-    [2, 2, 2, 2],
-    [2, 2, 4, None],
+
+Board = list[list[int]]
+
+
+class Representation(Protocol):
+    def __repr__(self) -> str:
+        ...
+
+    def __eq__(self, other: object) -> bool:
+        ...
+
+    def __iter__(self) -> Iterator[int]:
+        ...
+
+    @classmethod
+    def from_board(cls, board: Board, /) -> "Representation":
+        ...
+
+    def rotate(self) -> "Representation":
+        ...
+
+    def shift_left(self) -> "Representation":
+        ...
+
+    def spawn(self) -> "Representation":
+        ...
+
+    def highest_tile(self) -> int:
+        return max(self)
+
+    def num_empties(self) -> int:
+        return sum(1 if elem else 0 for elem in self)
+
+    def free_spots(self) -> list[tuple[int, int]]:
+        return [(idx // 4, idx % 4) for idx, elem in enumerate(self) if elem == 0]
+
+    def has_lost(self) -> bool:
+        if any(value == 0 for value in self):
+            return False
+        return all(self.move(direction) == self for direction in Direction)
+
+    def has_won(self) -> bool:
+        return self.highest_tile() == 2048
+
+    def rotate_n(self, n: int) -> "Representation":
+        result = self
+        for _ in range(n):
+            result = result.rotate()
+        return result
+
+    def move(self, direction: Direction, /) -> "Representation":
+        value = direction.value
+        return self.rotate_n(value).shift_left().rotate_n(4 - value)
+
+    def possible_moves(self) -> dict[Direction, "Representation"]:
+        return {
+            direction: new_rep
+            for direction in Direction
+            if (new_rep := self.move(direction)) != self
+        }
+
+
+class Strategy(Protocol):
+    def choose_move(self, rep: Representation, /) -> Representation | None:
+        ...
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}()"
+
+
+class Heuristic(Protocol):
+    def score(self, rep: Representation, /) -> int:
+        ...
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}()"
+
+
+# Common constants and helpers.
+
+
+STARTING_BOARD: Final[Board] = [
+    [2, 0, 0, 0],
+    [0, 2, 0, 0],
+    [0, 0, 0, 0],
+    [0, 0, 0, 0],
 ]
 
 
-def render(board):
-    for row in board:
-        s = ""
-        for col in row:
-            s += (f"{col}" if col else "_").rjust(4, " ")
-        print(s)
+SPAWN_POWERS: tuple[int, int, int, int] = (1, 1, 1, 2)
 
 
-def get_dir():
-    while True:
-        choice = input("> ")
-        try:
-            return {
-                "u": UP,
-                "r": RIGHT,
-                "d": DOWN,
-                "l": LEFT,
-            }[choice]
-        except KeyError:
-            print("strange key!")
-            pass
+def get_new_tile_power() -> int:
+    return random.choice(SPAWN_POWERS)
 
 
-def shift(items):
+def move_if_valid(rep: Representation, direction: Direction) -> Representation | None:
+    new_rep = rep.move(direction)
+    return new_rep if new_rep != rep else None
+
+
+# Naiive board representation.
+
+
+def shift(row: Collection[int]) -> list[int]:
     ret = []
-    items_without_none = [item for item in items if item is not None]
+    without_none = [entry for entry in row if entry != 0]
     i = 0
-    while i < len(items_without_none) - 1:
-        a = items_without_none[i]
-        b = items_without_none[i + 1]
-        if a == b:
-            ret.append(a + b)
+    while i < len(without_none) - 1:
+        left = without_none[i]
+        right = without_none[i + 1]
+        if left == right:
+            ret.append(2 * left)
             i += 1
         else:
-            ret.append(a)
+            ret.append(left)
         i += 1
 
-    if i == len(items_without_none) - 1:
-        ret.append(items_without_none[-1])
+    if i < len(without_none):
+        ret.append(without_none[-1])
 
-    return ret + [None] * (len(items) - len(ret))
+    return ret + [0] * (len(row) - len(ret))
 
 
-def left(board):
-    return [shift(row) for row in board]
+class NaiiveRep(Representation):
+    __slots__ = ("_board",)
 
+    def __init__(self, board: Board) -> None:
+        self._board = board
 
-# for row_idx in range(len(board)-2, -1, -1):
-#     for col_idx, col in enumerate(board[row_idx]):
-#         if board[row_idx][col_idx] is None:
-#             continue
-#         for dest_row_idx in range(row_idx+1, len(board)):
-#             us = board[row_idx][col_idx]
-#             dest = board[dest_row_idx][col_idx]
-#             # if dest == us:
-#             # print(col_idx, dest_row_idx, dest)
-#         # if row_idx > 0:
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, NaiiveRep) and self._board == other._board
 
+    def __iter__(self) -> Iterator[int]:
+        return (col for row in self._board for col in row)
 
-def rotate(board, rotations):
-    # four 32-bit ints
+    def __repr__(self) -> str:
+        result = []
+        for row in self._board:
+            s = ""
+            for col in row:
+                s += (f"{col}" if col else "_").rjust(4, " ")
+            result.append(s)
+        return "\n".join(result)
 
-    for _ in range(rotations):
-        board = list(map(list, list(zip(*board[::-1]))))
-    return board
+    @classmethod
+    def from_board(cls, board: Board) -> "NaiiveRep":
+        return cls(board)
 
+    def rotate(self) -> "NaiiveRep":
+        return NaiiveRep(list(map(list, zip(*self._board[::-1]))))
 
-def get_new_tile_power():
-    return random.choice([1, 1, 1, 2])
+    def shift_left(self) -> "NaiiveRep":
+        return NaiiveRep([shift(row) for row in self._board])
 
+    # Note that this mutates the current board. But at least its kinda fast.
+    def spawn(self) -> "NaiiveRep":
+        free_spots = self.free_spots()
+        if not free_spots:
+            print(self)
+            raise ValueError("No free spots?")
+        row_idx, col_idx = random.choice(self.free_spots())
+        self._board[row_idx][col_idx] = 2 ** get_new_tile_power()
+        return self
 
-def spawn(board):
-    free_spots = []
-    for row_idx in range(len(board)):
-        for col_idx in range(len(board[row_idx])):
-            if board[row_idx][col_idx] is None:
-                free_spots.append((row_idx, col_idx))
-    row_idx, col_idx = random.choice(free_spots)
-    board[row_idx][col_idx] = 2 ** get_new_tile_power()
-    return board
 
+# Code to generate `NumericRep.rotate()`.
 
-def has_won(board):
-    return any(col == 2048 for row in board for col in row)
 
+def create_col_component(row_idx: int, col_idx: int) -> str:
+    return (
+        f"(((rep[{3 - col_idx}] >> {8 * (3 - row_idx)}) & 0xff) << {8 * (3 - col_idx)})"
+    )
 
-def is_full(board):
-    return all(col is not None for row in board for col in row)
 
+def create_row_component(row_idx: int) -> str:
+    return " + ".join(create_col_component(row_idx, col_idx) for col_idx in range(4))
 
-def move(board, direction):
-    return rotate(left(rotate(board, direction)), 4 - direction)
 
+def create_numeric_rotate() -> str:
+    arg_sep = f',\n{8 * " "}'
+    return f"""\
+def rotate(self) -> "NumericRep":
+    rep = self._numbers
+    return NumericRep(
+        (
+            {arg_sep.join(create_row_component(row_idx) for row_idx in range(4))}
+        )
+    )
+"""
 
-# TODO add this optimization to numeric rep
-def has_lost(board):
-    if not is_full(board):
-        return False
-    return all(move(board, direction) == board for direction in DIRECTIONS)
 
-
-def win_or_lose(rep):
-    large_number = 10000000000
-    if rep.has_won():
-        return large_number
-    if rep.has_lost():
-        return -large_number
-    return None
-
-
-class EmptySpace:
-    def score(self, rep):
-        wl = win_or_lose(rep)
-        if wl:
-            return wl
-        return rep.num_empties()
-
-    def name(self):
-        return "EmptySpace"
-
-
-class HighestTile:
-    def score(self, rep):
-        wl = win_or_lose(rep)
-        if wl:
-            return wl
-        return rep.highest_tile()
-
-    def name(self):
-        return "HighestTile"
-
-
-class Combined:
-    def score(self, rep):
-        wl = win_or_lose(rep)
-        if wl:
-            return wl
-        return rep.num_empties() + rep.highest_tile()
-
-    def name(self):
-        return "Combined"
-
-
-class Random:
-    def choose_move(self, rep):
-        return random.choice(DIRECTIONS)
-
-    def name(self):
-        return "Random"
-
-
-class Human:
-    def choose_move(self, board):
-        render(board)
-        return get_dir()
-
-    def name(self):
-        return "Human"
-
-
-class OnePly:
-    def __init__(self, heuristic):
-        self.heuristic = heuristic
-
-    def choose_move(self, rep):
-        best_dir = None
-        best_score = None
-        for direction in DIRECTIONS:
-            if not move_is_valid(rep, direction):
-                continue
-            new_rep = rep.move(direction)
-            score = self.heuristic.score(new_rep)
-            if best_score is None or score > best_score:
-                best_dir = direction
-                best_score = score
-        return best_dir
-
-    def name(self):
-        return f"OnePly({self.heuristic.name()})"
-
-
-class MultiPly4:
-    def __init__(self, heuristic):
-        self.heuristic = heuristic
-
-    def choose_move(self, rep):
-        def inner_choose_move(rep, depth):
-            if depth == 0:
-                return self.heuristic.score(rep)
-            best_score = None
-            for direction in DIRECTIONS:
-                if not move_is_valid(rep, direction):
-                    continue
-                new_rep = rep.move(direction)
-                if depth >= 1:
-                    score = inner_choose_move(new_rep, depth - 1)
-                score = self.heuristic.score(new_rep)
-                if best_score is None or score > best_score:
-                    best_score = score
-            return best_score
-
-        best_dir = None
-        best_score = None
-        for direction in DIRECTIONS:
-            if not move_is_valid(rep, direction):
-                continue
-            new_rep = rep.move(direction)
-            score = inner_choose_move(new_rep, 4)
-            if best_score is None or score > best_score:
-                best_dir = direction
-                best_score = score
-        return best_dir
-
-    def name(self):
-        return f"MultiPly4({self.heuristic.name()})"
-
-
-def highest_tile(board):
-    return max(col for row in board for col in row if col is not None)
-
-
-def move_is_valid(rep, direction):
-    new_rep = rep.move(direction)
-    return new_rep != rep
-
-
-def run_game(strategy, Rep):
-    rep = Rep.from_board(starting_board)
-    count = 0
-    while not rep.has_lost() and not rep.has_won():
-        direction = strategy.choose_move(rep)
-        prev_rep = rep
-        rep = rep.move(direction)
-        if rep != prev_rep:
-            rep = rep.spawn()
-            count += 1
-    return rep.highest_tile(), count
-
-
-class Representation(ABC):
-    @abstractmethod
-    def move(self, direction):
-        ...
-
-    @abstractmethod
-    def __eq__(self, other):
-        ...
-
-    @abstractmethod
-    def highest_tile(self):
-        ...
-
-    @abstractmethod
-    def num_empties(self):
-        ...
-
-    @abstractmethod
-    def spawn(self):
-        ...
-
-    def has_lost(self):
-        if any(value == 0 for value in self):
-            return False
-        return all(self.move(direction) == self for direction in DIRECTIONS)
-
-    def has_won(self):
-        return self.highest_tile() == 2048
-
-
-def numeric_representation(board):
-    row_bits = []
-    for row in board:
-        row_num = 0
-        for i, elem in enumerate(row):
-            row_num += (elem.bit_length() - 1) << (3 - i) * 8 if elem is not None else 0
-        row_bits.append(row_num)
-    return tuple(row_bits)
-
-
-def print_numeric_representation(row_bits):
-    result = []
-    for n in row_bits:
-        s = ""
-        for i in range(4):
-            end = ", " if i != 3 else ""
-            s += str((n >> (3 - i) * 8) & 0xFF) + end
-        result.append(s)
-    return "\n".join(result)
-
-
-def create_rotate_rep():
-    code = "def rotate_rep(rep): return ("
-    rows = []
-    for row_idx in range(4):
-        row_components = []
-        for col_idx in range(4):
-            value = f"(((rep[{3 - col_idx}] >> {8 * (3 - row_idx)}) & 0xff) << {8 * (3 - col_idx)})"
-            row_components.append(value)
-        rows.append(" + ".join(row_components))
-    code += ", ".join(rows)
-    code += ")"
-
-    return code
-
-
-exec(create_rotate_rep())
-# print(dis.dis(rotate_rep))
-# quit()
-
-
-def rotate_rep_times(rep, num):
-    result = rep
-    for _ in range(num):
-        result = rotate_rep(result)
-    return result
-
-
-def left_rep(rep):
-    result = []
-    for row in rep:
-        c1 = (row >> 24) & 0xFF
-        c2 = (row >> 16) & 0xFF
-        c3 = (row >> 8) & 0xFF
-        c4 = row & 0xFF
-        row = [value for value in (c1, c2, c3, c4) if value != 0]
-        ret = 0
-        shift = 24
-        i = 0
-        while i < len(row) - 1:
-            a = row[i]
-            b = row[i + 1]
-            if a == b:
-                value = a + 1
-                i += 1
-            else:
-                value = a
-            ret += value << shift
-            shift -= 8
-            i += 1
-        if i == len(row) - 1:
-            ret += row[-1] << shift
-        result.append(ret)
-    return tuple(result)
+# Numeric representation.
+# Would maybe be more efficient to store left elements in low-order bits?
 
 
 class NumericRep(Representation):
     __slots__ = ("_numbers",)
 
-    def __init__(self, numbers):
+    def __init__(self, numbers: tuple[int, ...]) -> None:
         self._numbers = numbers
 
-    def __repr__(self):
-        return print_numeric_representation(self._numbers)
+    def __iter__(self) -> Iterator[int]:
+        for n in self._numbers:
+            for i in range(4):
+                power = (n >> (3 - i) * 8) & 0xFF
+                yield 2**power if power != 0 else 0
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, NumericRep) and self._numbers == other._numbers
+
+    def __repr__(self) -> str:
+        result = []
+        for n in self._numbers:
+            s = ""
+            for i in range(4):
+                end = ", " if i != 3 else ""
+                s += str((n >> (3 - i) * 8) & 0xFF) + end
+            result.append(s)
+        return "\n".join(result)
 
     @classmethod
-    def from_board(cls, board):
-        return cls(numeric_representation(board))
+    def from_board(cls, board: Board) -> "NumericRep":
+        row_bits = []
+        for row in board:
+            row_num = 0
+            for i, elem in enumerate(row):
+                row_num += (elem.bit_length() - 1) << (3 - i) * 8 if elem != 0 else 0
+            row_bits.append(row_num)
+        return cls(tuple(row_bits))
 
-    def move(self, direction):
-        return NumericRep(
-            rotate_rep_times(
-                left_rep(rotate_rep_times(self._numbers, direction)), 4 - direction
+    # Generated by `create_numeric_rep` above.
+    def rotate(self) -> "NumericRep":
+        rep = self._numbers
+        return type(self)(
+            (
+                (((rep[3] >> 24) & 0xFF) << 24)
+                + (((rep[2] >> 24) & 0xFF) << 16)
+                + (((rep[1] >> 24) & 0xFF) << 8)
+                + (((rep[0] >> 24) & 0xFF) << 0),
+                (((rep[3] >> 16) & 0xFF) << 24)
+                + (((rep[2] >> 16) & 0xFF) << 16)
+                + (((rep[1] >> 16) & 0xFF) << 8)
+                + (((rep[0] >> 16) & 0xFF) << 0),
+                (((rep[3] >> 8) & 0xFF) << 24)
+                + (((rep[2] >> 8) & 0xFF) << 16)
+                + (((rep[1] >> 8) & 0xFF) << 8)
+                + (((rep[0] >> 8) & 0xFF) << 0),
+                (((rep[3] >> 0) & 0xFF) << 24)
+                + (((rep[2] >> 0) & 0xFF) << 16)
+                + (((rep[1] >> 0) & 0xFF) << 8)
+                + (((rep[0] >> 0) & 0xFF) << 0),
             )
         )
 
-    def __eq__(self, other):
-        return self._numbers == other._numbers
+    def shift_left(self) -> "NumericRep":
+        result = []
+        for row in self._numbers:
+            c1 = (row >> 24) & 0xFF
+            c2 = (row >> 16) & 0xFF
+            c3 = (row >> 8) & 0xFF
+            c4 = row & 0xFF
+            row_list = [value for value in (c1, c2, c3, c4) if value != 0]
+            ret = 0
+            shift = 24
+            i = 0
+            while i < len(row_list) - 1:
+                a = row_list[i]
+                b = row_list[i + 1]
+                if a == b:
+                    value = a + 1
+                    i += 1
+                else:
+                    value = a
+                ret += value << shift
+                shift -= 8
+                i += 1
+            if i == len(row_list) - 1:
+                ret += row_list[-1] << shift
+            result.append(ret)
+        return NumericRep(tuple(result))
 
-    def highest_tile(self):
-        return 2 ** max(self)
-
-    def num_empties(self):
-        return sum(1 if value == 0 else 0 for value in self)
-
-    def __iter__(self):
-        return (n >> (3 - i) * 8 & 0xFF for n in self._numbers for i in range(4))
-
-    def spawn(self):
-        possible = []
-        for idx, value in enumerate(self):
-            if value == 0:
-                row = idx // 4
-                col = idx % 4
-                possible.append((row, col))
-        row, col = random.choice(possible)
+    def spawn(self) -> "NumericRep":
+        free_spots = self.free_spots()
+        if not free_spots:
+            print(self)
+            raise ValueError("No free spots?")
+        row, col = random.choice(self.free_spots())
         to_add = get_new_tile_power() << (3 - col) * 8
         return NumericRep(
             (
@@ -432,24 +326,217 @@ class NumericRep(Representation):
         )
 
 
-def compare_strategies(strategies):
-    NUMBER_OF_RUNS = 10
-    for strategy in strategies:
-        scores = []
-        for _ in range(NUMBER_OF_RUNS):
-            score, _ = run_game(strategy, NumericRep)
-            scores.append(score)
-        print(
-            f"Stats for {strategy.name()}; max: {max(scores)}, avg: {sum(scores) / len(scores)}"
+# Heuristics.
+
+
+def win_or_lose(rep: Representation) -> int | None:
+    large_number = 10000000000
+    if rep.has_won():
+        return large_number
+    if rep.has_lost():
+        return -large_number
+    return None
+
+
+class EmptySpace(Heuristic):
+    def score(self, rep: Representation) -> int:
+        wl = win_or_lose(rep)
+        if wl:
+            return wl
+        return rep.num_empties()
+
+
+class HighestTile(Heuristic):
+    def score(self, rep: Representation) -> int:
+        wl = win_or_lose(rep)
+        if wl:
+            return wl
+        return rep.highest_tile()
+
+
+class Combined(Heuristic):
+    def score(self, rep: Representation) -> int:
+        wl = win_or_lose(rep)
+        if wl:
+            return wl
+        return rep.num_empties() + rep.highest_tile()
+
+
+# Strategies.
+
+
+class Random(Strategy):
+    def choose_move(self, rep: Representation) -> Representation | None:
+        possible_moves = list(rep.possible_moves().values())
+        if not possible_moves:
+            return None
+        return random.choice(possible_moves)
+
+
+class Human(Strategy):
+    def choose_move(self, rep: Representation) -> Representation | None:
+        possible_moves = rep.possible_moves()
+        print(f"Current board: \n{rep}\n")
+        while True:
+            # TODO: refactor this to await some sort of arrow key press?
+            choice = input("> ")
+            try:
+                direction = {
+                    "u": Direction.UP,
+                    "r": Direction.RIGHT,
+                    "d": Direction.DOWN,
+                    "l": Direction.LEFT,
+                }[choice]
+            except KeyError:
+                print("Strange key! Try again.")
+                continue
+            try:
+                return possible_moves[direction]
+            except KeyError:
+                print(
+                    f"Sorry, you can't move {direction} on the current board, try a different direction."
+                )
+
+
+class OnePly(Strategy):
+    def __init__(self, heuristic: Heuristic) -> None:
+        self._heuristic = heuristic
+
+    def __repr__(self) -> str:
+        return f"OnePly({self._heuristic!r})"
+
+    def choose_move(self, rep: Representation) -> Representation | None:
+        return max(
+            (
+                new_rep
+                for direction in Direction
+                if (new_rep := move_if_valid(rep, direction)) is not None
+            ),
+            key=self._heuristic.score,  # type: ignore
+            default=None,
         )
 
 
-compare_strategies(
-    [
-        Random(),
-        OnePly(HighestTile()),
-        OnePly(EmptySpace()),
-        OnePly(Combined()),
-        MultiPly4(Combined()),
-    ]
-)
+class MultiPly4(Strategy):
+    def __init__(self, heuristic: Heuristic) -> None:
+        self._heuristic = heuristic
+
+    def __repr__(self) -> str:
+        return f"MultiPly4({self._heuristic!r})"
+
+    def choose_move(self, rep: Representation) -> Representation | None:
+        def score(rep: Representation, depth: int) -> int | None:
+            if depth == 0:
+                return self._heuristic.score(rep)
+            return max(
+                (
+                    score(new_rep, depth - 1) or 0
+                    for direction in Direction
+                    if (new_rep := move_if_valid(rep, direction)) is not None
+                ),
+                default=None,
+            )
+
+        return max(
+            (
+                new_rep
+                for direction in Direction
+                if (new_rep := move_if_valid(rep, direction)) is not None
+            ),
+            key=lambda rep: score(rep, 4) or 0,  # type: ignore
+            default=None,
+        )
+
+
+@dataclass
+class GameResult:
+    highest_tile: int
+    number_of_moves: int
+    wall_time_s: float
+
+
+def run_game(strategy: Strategy, rep_cls: Type[Representation]) -> GameResult:
+    start_time = perf_counter()
+    rep = rep_cls.from_board(STARTING_BOARD)
+    count = 0
+    while not rep.has_lost() and not rep.has_won():
+        maybe_rep = strategy.choose_move(rep)
+        assert maybe_rep is not None, "We must have lost?"
+        rep = maybe_rep.spawn()
+        count += 1
+    end_time = perf_counter()
+    return GameResult(rep.highest_tile(), count, end_time - start_time)
+
+
+@dataclass
+class StrategyStats:
+    strategy: Strategy
+    rep_cls: Type[Representation]
+    avg_time: float
+    max_score: int
+    avg_score: float
+
+
+def compare_strategies(
+    strategies: Iterable[Strategy],
+    rep_classes: Sequence[Type[Representation]],
+    iterations: int = 1000,
+    in_process: bool = False,
+) -> list[StrategyStats]:
+    stats = []
+    for strategy in strategies:
+        for rep_cls in rep_classes:
+            print(
+                f"Running strategy {strategy} with representation {rep_cls.__name__}..."
+            )
+            run = partial(run_game, strategy, rep_cls)
+            if in_process:
+                results = [run() for _ in tqdm(range(iterations), total=iterations)]
+            else:
+                with ProcessPoolExecutor() as executor:
+                    futures = [executor.submit(run) for _ in range(iterations)]
+                    results = [
+                        future.result()
+                        for future in tqdm(as_completed(futures), total=iterations)
+                    ]
+            avg_time = sum(result.wall_time_s for result in results) / len(results)
+            max_score = max(result.highest_tile for result in results)
+            avg_score = sum(result.highest_tile for result in results) / len(results)
+            stats.append(
+                StrategyStats(strategy, rep_cls, avg_time, max_score, avg_score)
+            )
+    return stats
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gen_numeric_rotate", action="store_true")
+    parser.add_argument("--in_process", action="store_true")
+    args = parser.parse_args(argv)
+    if args.gen_numeric_rotate:
+        print(create_numeric_rotate())
+        return 0
+
+    for stats in compare_strategies(
+        [
+            Random(),
+            OnePly(HighestTile()),
+            OnePly(EmptySpace()),
+            OnePly(Combined()),
+            MultiPly4(HighestTile()),
+            MultiPly4(EmptySpace()),
+            MultiPly4(Combined()),
+        ],
+        [
+            NaiiveRep,
+            NumericRep,
+        ],
+        iterations=10 if args.in_process else 1000,
+        in_process=args.in_process,
+    ):
+        print(stats)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
